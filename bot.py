@@ -1,27 +1,20 @@
-!pip install ccxt
-!pip install pyTelegramBotAPI
-!pip install pytz
-
 import pytz
-import time
 import pandas as pd
 import numpy as np
 import ccxt
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import os
 
-# Telegram Bot Token
-TELEGRAM_BOT_TOKEN = "8407292335:AAHrK5JzfpB8nOqZdz6NTL1bPdjSJIPcZNk"
-TELEGRAM_CHAT_ID = "@fetihbot1453"
+# Telegram token ve chat ID environment variables ile Railway'den çekilecek
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Zaman aralığı
 INTERVAL = "5m"
 
 # İzlenecek semboller
-SYMBOLS = [
-    "BTC/USDT","AVAX/USDT","SOL/USDT","LTC/USDT","AAVE/USDT",
-    "LINK/USDT"
-]
+SYMBOLS = ["BTC/USDT","AVAX/USDT","SOL/USDT","LTC/USDT","AAVE/USDT","LINK/USDT"]
 
 # Botu başlat
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
@@ -30,29 +23,23 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 exchange = ccxt.okx()
 
 # OKX interval eşlemesi
-interval_map = {
-    "1m": "1m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1h"
-}
+interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h"}
 
 def get_historical_data(symbol, interval, limit=500):
     """OKX public OHLCV verisi çek"""
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=interval_map[interval], limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-    df = df.apply(pd.to_numeric, errors='coerce')  # FutureWarning giderildi
+    df = df.apply(pd.to_numeric, errors='coerce')
     return df
 
-def calculate_indicators(df):
-    """EMA + ATR + Sinyal hesaplama"""
+def calculate_signal(df):
+    """EMA + ATR + Sinyal hesaplama (fitiller dahil)"""
     df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
 
-    # ATR (fitiller dahil)
+    # ATR
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift(1))
     low_close = np.abs(df['low'] - df['close'].shift(1))
@@ -81,79 +68,58 @@ def calculate_indicators(df):
     df['sellBelow'] = df['sellCross'] & (df['close'] < df['ema200'])
     df['sellAbove'] = df['buyCrossa'] & (df['close'] >= df['ema200'])
 
-    df['atrValue'] = df['atr'] * 1.5
+    df['atrValue'] = df['atr'] * 2
     RR = 2.0
 
     last_row = df.iloc[-1]
-    signal, tp, sl, entry, signal_emoji = None, None, None, last_row['close'], ""
+    signal, tp, sl, entry, emoji = None, None, None, last_row['close'], ""
 
     if last_row['buyAbove']:
-        signal = "BUY"
-        signal_emoji = "🚀"
-        sl = entry - last_row['atrValue']
-        tp = entry + RR * last_row['atrValue']
+        signal = "BUY"; emoji="🚀"
+        sl = entry - last_row['atrValue']; tp = entry + RR*last_row['atrValue']
     elif last_row['buyBelow']:
-        signal = "GO (SELL)"
-        signal_emoji = "🔽"
-        sl = entry + last_row['atrValue']
-        tp = entry - RR * last_row['atrValue']
+        signal = "GO (SELL)"; emoji="🔽"
+        sl = entry + last_row['atrValue']; tp = entry - RR*last_row['atrValue']
     elif last_row['sellAbove']:
-        signal = "GO (BUY)"
-        signal_emoji = "🔼"
-        sl = entry - last_row['atrValue']
-        tp = entry + RR * last_row['atrValue']
+        signal = "GO (BUY)"; emoji="🔼"
+        sl = entry - last_row['atrValue']; tp = entry + RR*last_row['atrValue']
     elif last_row['sellBelow']:
-        signal = "SELL"
-        signal_emoji = "💣"
-        sl = entry + last_row['atrValue']
-        tp = entry - RR * last_row['atrValue']
+        signal = "SELL"; emoji="💣"
+        sl = entry + last_row['atrValue']; tp = entry - RR*last_row['atrValue']
 
-    return signal, tp, sl, entry, signal_emoji
+    return signal, tp, sl, entry, emoji
 
-def main():
-    last_signal_bar = {symbol: None for symbol in SYMBOLS}
+def run_bot():
     istanbul_tz = pytz.timezone('Europe/Istanbul')
+    for symbol in SYMBOLS:
+        try:
+            df = get_historical_data(symbol, INTERVAL)
+            signal, tp, sl, entry, emoji = calculate_signal(df)
+            current_bar = df.iloc[-1]['timestamp']
+            current_bar_local = pd.to_datetime(current_bar, unit='ms', utc=True).tz_convert(istanbul_tz)
 
-    while True:
-        now = pd.Timestamp.utcnow()
-        # sadece mum kapanışında kontrol et (örn: xx:00, xx:05, xx:10...)
-        if now.minute % 5 == 0 and 10 <= now.second < 20:
-            for SYMBOL in SYMBOLS:
-                try:
-                    df = get_historical_data(SYMBOL, INTERVAL)
-                except Exception as e:
-                    print(f"{SYMBOL} veri çekme hatası: {e}")
-                    continue
+            if signal:
+                tv_symbol = symbol.replace("/", "")
+                tv_url = f"https://www.tradingview.com/chart/?symbol=OKX:{tv_symbol}&interval=5"
 
-                signal, tp, sl, entry, signal_emoji = calculate_indicators(df)
-                current_bar = df.iloc[-1]['timestamp']
-                current_bar_local = pd.to_datetime(current_bar, unit='ms', utc=True).tz_convert(istanbul_tz)
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("📈 Grafiği Aç", url=tv_url))
 
-                if signal and current_bar != last_signal_bar[SYMBOL]:
-                    tv_symbol = SYMBOL.replace("/", "")
-                    tv_url = f"https://www.tradingview.com/chart/?symbol=OKX:{tv_symbol}&interval=5"
+                message = (
+                    f"{emoji} Sinyal: {signal}\n"
+                    f"📊 Sembol: {symbol}\n"
+                    f"🟢 Giriş: {round(entry,2)}\n"
+                    f"💰 TP: {round(tp,2)}\n"
+                    f"⛔ SL: {round(sl,2)}\n"
+                    f"⏱ Zaman: {current_bar_local.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
 
-                    markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton("📈 Grafiği Aç", url=tv_url))
-
-                    message = (
-                        f"{signal_emoji} Sinyal: {signal}\n"
-                        f"📊 Sembol: {SYMBOL}\n"
-                        f"🟢 Giriş: {round(entry,2)}\n"
-                        f"💰 TP: {round(tp,2)}\n"
-                        f"⛔ SL: {round(sl,2)}\n"
-                        f"⏱ Zaman: {current_bar_local.strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-
-                    bot.send_message(TELEGRAM_CHAT_ID, message, reply_markup=markup)
-                    print(f"\n🟢 {SYMBOL} → Yeni Sinyal Gönderildi:\n{message}")
-                    last_signal_bar[SYMBOL] = current_bar
-                else:
-                    print(f"{current_bar_local} → ⚪ {SYMBOL} → Sinyal yok")
-
-            time.sleep(10)  # sonraki dakika kontrolü
-        else:
-            time.sleep(1)
+                bot.send_message(TELEGRAM_CHAT_ID, message, reply_markup=markup)
+                print(f"{current_bar_local} → {symbol} → Sinyal gönderildi")
+            else:
+                print(f"{current_bar_local} → {symbol} → Sinyal yok")
+        except Exception as e:
+            print(f"{symbol} veri veya hesaplama hatası: {e}")
 
 if __name__ == "__main__":
-    main()
+    run_bot()
